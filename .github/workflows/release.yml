@@ -1,55 +1,23 @@
 name: Release
 
-# Manually triggered ("Run workflow"). Builds a self-contained bundle for each
-# platform on its own runner (no cross-compile), publishes a GitHub Release with
-# all archives, and publishes the npm thin-installer (shim + per-platform
-# packages). Bump package.json + finalize the CHANGELOG before triggering.
+# Manually triggered ("Run workflow"). On trigger it:
+#   1. reads the version from package.json,
+#   2. builds a self-contained bundle for every platform (one runner — there's no
+#      native compilation, so cross-packaging is fine),
+#   3. creates the GitHub Release (tag v<version>) with all archives, using the
+#      release notes from CHANGELOG.md,
+#   4. publishes the npm thin-installer (shim + per-platform packages).
+#
+# Before triggering: bump package.json and make sure CHANGELOG.md has the matching
+# section (## [<version>], or ## [Unreleased]). Set the NPM_TOKEN repo secret.
 on:
-  workflow_dispatch:
-    inputs:
-      version:
-        description: "Version to release (default: package.json version)"
-        required: false
-        type: string
-      publish_npm:
-        description: "Publish to npm"
-        required: false
-        type: boolean
-        default: true
+  workflow_dispatch: {}
 
 permissions:
   contents: write   # create the GitHub Release + tag
 
 jobs:
-  build:
-    name: Build ${{ matrix.target }}
-    runs-on: ${{ matrix.os }}
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - { target: darwin-arm64, os: macos-14 }
-          - { target: darwin-x64,   os: macos-13 }
-          - { target: linux-x64,    os: ubuntu-latest }
-          - { target: linux-arm64,  os: ubuntu-24.04-arm }
-          # Windows (win32-x64 / win32-arm64): TODO — build-bundle.sh is unix-only.
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
-        with:
-          node-version: 22
-      - run: npm ci
-      - name: Build bundle
-        run: bash scripts/build-bundle.sh ${{ matrix.target }}
-      - uses: actions/upload-artifact@v4
-        with:
-          name: bundle-${{ matrix.target }}
-          path: release/codegraph-${{ matrix.target }}.tar.gz
-          if-no-files-found: error
-
   release:
-    name: Publish release
-    needs: build
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -58,42 +26,41 @@ jobs:
           node-version: 22
           registry-url: https://registry.npmjs.org
       - run: npm ci
+      - name: Ensure zip/unzip
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq zip unzip
+
+      - name: Build all platform bundles
+        run: |
+          for t in darwin-arm64 darwin-x64 linux-x64 linux-arm64 win32-x64 win32-arm64; do
+            bash scripts/build-bundle.sh "$t"
+          done
+          ls -lh release
 
       - name: Resolve version
         id: ver
-        run: |
-          V="${{ inputs.version }}"
-          [ -n "$V" ] || V="$(node -p "require('./package.json').version")"
-          echo "version=$V" >> "$GITHUB_OUTPUT"
+        run: echo "version=$(node -p "require('./package.json').version")" >> "$GITHUB_OUTPUT"
 
-      - name: Collect bundles
-        uses: actions/download-artifact@v4
-        with:
-          path: artifacts
-          pattern: bundle-*
-          merge-multiple: true
-      - run: mkdir -p release && cp artifacts/*.tar.gz release/ && ls -lh release
-
-      - name: Release notes
-        id: notes
+      - name: Release notes from CHANGELOG.md
         run: |
-          if node scripts/extract-release-notes.mjs "${{ steps.ver.outputs.version }}" > /tmp/notes.md 2>/dev/null && [ -s /tmp/notes.md ]; then
-            echo "file=/tmp/notes.md" >> "$GITHUB_OUTPUT"
+          V="${{ steps.ver.outputs.version }}"
+          node scripts/extract-release-notes.mjs "$V" > notes.md 2>/dev/null \
+            || node scripts/extract-release-notes.mjs Unreleased > notes.md 2>/dev/null || true
+          if [ ! -s notes.md ]; then
+            echo "::error::No release notes in CHANGELOG.md for [$V] or [Unreleased]."
+            exit 1
           fi
+          echo "----- release notes -----"; cat notes.md
 
       - name: Create GitHub Release
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          TAG="v${{ steps.ver.outputs.version }}"
-          if [ -n "${{ steps.notes.outputs.file }}" ]; then
-            gh release create "$TAG" release/*.tar.gz --title "$TAG" --notes-file "${{ steps.notes.outputs.file }}"
-          else
-            gh release create "$TAG" release/*.tar.gz --title "$TAG" --generate-notes
-          fi
+          gh release create "v${{ steps.ver.outputs.version }}" \
+            release/codegraph-* \
+            --title "v${{ steps.ver.outputs.version }}" \
+            --notes-file notes.md
 
       - name: Publish to npm
-        if: ${{ inputs.publish_npm }}
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
         run: |

@@ -27,19 +27,35 @@ rm -rf "$NPM"
 mkdir -p "$NPM/main"
 
 shopt -s nullglob
-archives=("$REL"/codegraph-*.tar.gz)
+archives=("$REL"/codegraph-*.tar.gz "$REL"/codegraph-*.zip)
 [ ${#archives[@]} -gt 0 ] || { echo "[pack-npm] no bundles in $REL — run build-bundle.sh first" >&2; exit 1; }
 
 targets=()
 for archive in "${archives[@]}"; do
-  base="$(basename "$archive" .tar.gz)"   # codegraph-<target>
-  target="${base#codegraph-}"             # <target>, e.g. darwin-arm64
-  os="${target%-*}"                       # darwin
-  arch="${target##*-}"                    # arm64
+  fname="$(basename "$archive")"
+  case "$fname" in
+    *.tar.gz) base="${fname%.tar.gz}" ;;   # codegraph-<target>
+    *.zip)    base="${fname%.zip}" ;;
+  esac
+  target="${base#codegraph-}"             # <target>, e.g. darwin-arm64 / win32-x64
+  os="${target%-*}"                       # darwin | linux | win32
+  arch="${target##*-}"                    # arm64 | x64
   pkgdir="$NPM/$base"
   mkdir -p "$pkgdir"
-  tar -xzf "$archive" -C "$pkgdir" --strip-components=1
-  VERSION="$VERSION" SCOPE="$SCOPE" TARGET="$target" OSV="$os" ARCHV="$arch" \
+  case "$fname" in
+    *.zip)
+      tmpx="$(mktemp -d)"
+      unzip -q "$archive" -d "$tmpx"
+      mv "$tmpx/codegraph-${target}"/* "$pkgdir"/
+      rm -rf "$tmpx"
+      nodefile="node.exe"
+      ;;
+    *)
+      tar -xzf "$archive" -C "$pkgdir" --strip-components=1
+      nodefile="node"
+      ;;
+  esac
+  VERSION="$VERSION" SCOPE="$SCOPE" TARGET="$target" OSV="$os" ARCHV="$arch" NODEFILE="$nodefile" \
     node -e '
       const fs=require("fs");
       fs.writeFileSync(process.argv[1], JSON.stringify({
@@ -47,7 +63,7 @@ for archive in "${archives[@]}"; do
         version: process.env.VERSION,
         description: `CodeGraph self-contained bundle for ${process.env.TARGET}`,
         os: [process.env.OSV], cpu: [process.env.ARCHV],
-        files: ["node","lib","bin"],
+        files: [process.env.NODEFILE, "lib", "bin"],
         license: "MIT"
       }, null, 2) + "\n");
     ' "$pkgdir/package.json"

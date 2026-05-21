@@ -3,18 +3,21 @@
 # Build a self-contained CodeGraph bundle: an official Node runtime + the
 # compiled app + its production deps, so CodeGraph runs with NO system Node and
 # NO native build — node:sqlite is built into the bundled Node. One archive per
-# platform; the recipe is identical across platforms (only the Node download
-# differs), so a CI matrix produces all of them.
+# platform.
+#
+# Because dropping better-sqlite3 left zero native addons, the recipe is pure
+# file-packaging (download the target's Node, copy the app, archive) — so any
+# platform's bundle can be built on any OS. No cross-compile, no native runners.
 #
 # Usage:
 #   scripts/build-bundle.sh <target> [node-version]
 #     target:        darwin-arm64 | darwin-x64 | linux-x64 | linux-arm64
+#                  | win32-x64 | win32-arm64
 #     node-version:  e.g. v24.16.0 (default below; pin for reproducible builds)
 #
-# Output: release/codegraph-<target>.tar.gz  (extracts to codegraph-<target>/)
-#
-# NOTE: does not cross-compile — the bundled Node binary is the official build
-# for <target>, but to *run-test* a bundle you must be on that platform.
+# Output:
+#   unix:    release/codegraph-<target>.tar.gz   (launcher: bin/codegraph)
+#   windows: release/codegraph-<target>.zip      (launcher: bin/codegraph.cmd)
 set -euo pipefail
 
 TARGET="${1:?usage: build-bundle.sh <target> [node-version]}"
@@ -25,46 +28,71 @@ OUT="$ROOT/release"
 WORK="$(mktemp -d)"
 trap 'rm -rf "$WORK"' EXIT
 
-NODE_DIST="node-${NODE_VERSION}-${TARGET}"
-NODE_URL="https://nodejs.org/dist/${NODE_VERSION}/${NODE_DIST}.tar.gz"
+ARCH="${TARGET##*-}"   # x64 | arm64
+OSFAM="${TARGET%-*}"   # darwin | linux | win32
 
 echo "[bundle] target=${TARGET} node=${NODE_VERSION}"
 
 # 1. Download + extract the official Node runtime for the target platform.
-echo "[bundle] downloading ${NODE_URL}"
-curl -fsSL "$NODE_URL" -o "$WORK/node.tar.gz"
-tar -xzf "$WORK/node.tar.gz" -C "$WORK"
-NODE_BIN="$WORK/${NODE_DIST}/bin/node"
-[ -f "$NODE_BIN" ] || { echo "[bundle] error: node binary not found in tarball" >&2; exit 1; }
+if [ "$OSFAM" = "win32" ]; then
+  NODE_DIST="node-${NODE_VERSION}-win-${ARCH}"
+  NODE_URL="https://nodejs.org/dist/${NODE_VERSION}/${NODE_DIST}.zip"
+  echo "[bundle] downloading ${NODE_URL}"
+  curl -fsSL "$NODE_URL" -o "$WORK/node.zip"
+  if command -v unzip >/dev/null 2>&1; then
+    unzip -q "$WORK/node.zip" -d "$WORK"
+  else
+    tar -xf "$WORK/node.zip" -C "$WORK"   # bsdtar can read zip
+  fi
+  NODE_BIN="$WORK/${NODE_DIST}/node.exe"
+else
+  NODE_DIST="node-${NODE_VERSION}-${TARGET}"
+  NODE_URL="https://nodejs.org/dist/${NODE_VERSION}/${NODE_DIST}.tar.gz"
+  echo "[bundle] downloading ${NODE_URL}"
+  curl -fsSL "$NODE_URL" -o "$WORK/node.tar.gz"
+  tar -xzf "$WORK/node.tar.gz" -C "$WORK"
+  NODE_BIN="$WORK/${NODE_DIST}/bin/node"
+fi
+[ -f "$NODE_BIN" ] || { echo "[bundle] error: node binary not found ($NODE_BIN)" >&2; exit 1; }
 
 # 2. Build the app (compiled JS + copied wasm/schema assets).
 echo "[bundle] building app"
 ( cd "$ROOT" && npm run build >/dev/null )
 
-# 3. Stage: vendored node + app + production-only deps + launcher.
+# 3. Stage: app + production-only deps (pure JS/wasm → portable across platforms).
 STAGE="$WORK/codegraph-${TARGET}"
 mkdir -p "$STAGE/lib" "$STAGE/bin"
-cp "$NODE_BIN" "$STAGE/node"
 cp -R "$ROOT/dist" "$STAGE/lib/dist"
 cp "$ROOT/package.json" "$ROOT/package-lock.json" "$STAGE/lib/"
 echo "[bundle] installing production dependencies"
 ( cd "$STAGE/lib" && npm ci --omit=dev --ignore-scripts >/dev/null 2>&1 )
 rm -f "$STAGE/lib/package-lock.json"
 
-# 4. Launcher: exec the vendored Node with the app entry. `exec` replaces the
-#    shell so there's a single process, and the absolute path means the bundled
-#    Node is used regardless of what's (or isn't) on the user's PATH.
-cat > "$STAGE/bin/codegraph" <<'LAUNCH'
+# 4. Vendored Node + launcher (the launcher uses the bundled Node by relative
+#    path, so no system Node is ever needed).
+if [ "$OSFAM" = "win32" ]; then
+  cp "$NODE_BIN" "$STAGE/node.exe"
+  printf '@"%%~dp0..\\node.exe" "%%~dp0..\\lib\\dist\\bin\\codegraph.js" %%*\r\n' \
+    > "$STAGE/bin/codegraph.cmd"
+else
+  cp "$NODE_BIN" "$STAGE/node"
+  cat > "$STAGE/bin/codegraph" <<'LAUNCH'
 #!/bin/sh
 DIR="$(cd "$(dirname "$0")/.." && pwd)"
 exec "$DIR/node" "$DIR/lib/dist/bin/codegraph.js" "$@"
 LAUNCH
-chmod +x "$STAGE/bin/codegraph"
+  chmod +x "$STAGE/bin/codegraph"
+fi
 
-# 5. Archive.
+# 5. Archive (.zip for Windows, .tar.gz otherwise).
 mkdir -p "$OUT"
-ARCHIVE="$OUT/codegraph-${TARGET}.tar.gz"
-# --no-xattrs: don't embed macOS extended attributes (com.apple.provenance),
-# which make GNU tar warn noisily when the archive is extracted on Linux.
-tar --no-xattrs -czf "$ARCHIVE" -C "$WORK" "codegraph-${TARGET}"
+if [ "$OSFAM" = "win32" ]; then
+  ARCHIVE="$OUT/codegraph-${TARGET}.zip"
+  rm -f "$ARCHIVE"
+  ( cd "$WORK" && zip -rqX "$ARCHIVE" "codegraph-${TARGET}" )
+else
+  ARCHIVE="$OUT/codegraph-${TARGET}.tar.gz"
+  # --no-xattrs: don't embed macOS xattrs that make GNU tar warn on Linux.
+  tar --no-xattrs -czf "$ARCHIVE" -C "$WORK" "codegraph-${TARGET}"
+fi
 echo "[bundle] wrote ${ARCHIVE} ($(du -h "$ARCHIVE" | cut -f1))"

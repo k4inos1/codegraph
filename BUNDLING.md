@@ -16,24 +16,28 @@ platform, identical recipe (only the Node download differs):
 
 ```
 codegraph-<target>/
-  node                     # official Node runtime for <target>
+  node | node.exe          # official Node runtime for <target>
   lib/
     dist/                  # compiled app (+ tree-sitter .wasm grammars, schema.sql)
     node_modules/          # production deps only (pure JS / wasm — portable)
   bin/
-    codegraph              # launcher: exec "$DIR/node" "$DIR/lib/dist/bin/codegraph.js" "$@"
+    codegraph | codegraph.cmd   # launcher → runs the bundled Node with the app
 ```
 
-Targets: `darwin-arm64`, `darwin-x64`, `linux-x64`, `linux-arm64` (Windows: TODO).
+Targets: `darwin-arm64`, `darwin-x64`, `linux-x64`, `linux-arm64`, `win32-x64`,
+`win32-arm64`. Unix targets produce `.tar.gz` (shell launcher); Windows produces
+`.zip` (`node.exe` + a `.cmd` launcher).
 
 ```bash
 scripts/build-bundle.sh linux-x64            # -> release/codegraph-linux-x64.tar.gz
-scripts/build-bundle.sh darwin-arm64 v24.16.0
+scripts/build-bundle.sh win32-x64            # -> release/codegraph-win32-x64.zip
 ```
 
-Note: the script does **not** cross-compile — it downloads the official Node
-binary for `<target>`, but to *run-test* a bundle you must be on that platform
-(or emulate it, e.g. `docker run --platform linux/amd64`).
+Because dropping better-sqlite3 left **zero native addons**, building a bundle is
+pure file-packaging — **any** target builds on **any** OS (the whole matrix builds
+on one Linux runner). Cross-compilation isn't a concern; only *run-testing* a
+bundle needs the target platform (or emulation, e.g. `docker run --platform
+linux/amd64`).
 
 ## Install channels (all deliver the same bundle)
 
@@ -47,16 +51,22 @@ binary for `<target>`, but to *run-test* a bundle you must be on that platform
    (`@colbymchenry/codegraph-<target>` with `os`/`cpu`), so npm installs only the
    matching one. The shim — run by the user's Node — execs the bundle, so the
    real work runs on the bundled Node 24. Works even on old Node.
-3. **Homebrew / Scoop** — TODO (tap + cask pointing at the Release archives).
+3. **Windows** ([`install.ps1`](install.ps1)) — `irm … | iex`; same flow as
+   install.sh (detect arch, pull the `.zip` from Releases, add to PATH).
+4. **Homebrew / Scoop** — TODO (tap + cask pointing at the Release archives).
 
-## Release pipeline (TODO)
+## Release pipeline
 
-- CI matrix (one runner per os/arch) runs `build-bundle.sh`, uploads each archive
-  to the GitHub Release.
-- Publish the npm main shim package + the per-platform packages.
-- **Code signing** is the main gap for "download & run": macOS Gatekeeper needs a
+[`.github/workflows/release.yml`](.github/workflows/release.yml) — manually
+triggered. Reads the version from `package.json`, builds every platform bundle on
+one runner, creates the GitHub Release (notes from `CHANGELOG.md`), and publishes
+the npm shim + per-platform packages. Requires the `NPM_TOKEN` repo secret.
+
+Still TODO:
+- **Code signing** — the main gap for "download & run": macOS Gatekeeper needs a
   Developer ID + notarization; Windows needs Authenticode. Homebrew softens the
   macOS case (handles quarantine).
-- Once bundles ship, retire the Node-version gate in `src/bin/codegraph.ts` — the
-  bundle always runs Node 24, and the npm shim does no tree-sitter work, so no
-  version check is needed.
+- Retire the now-vestigial Node-version gate in `src/bin/codegraph.ts` — the
+  bundle always runs Node 24, and the npm shim does no tree-sitter work.
+- Re-wire `npm uninstall` cleanup (the agent-config `preuninstall`) through the
+  shim — the generated main package doesn't carry it.
