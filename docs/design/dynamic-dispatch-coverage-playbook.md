@@ -192,7 +192,7 @@ Status legend: ✅ done+validated · 🔬 hole identified · ⬜ not started.
 | PHP | Laravel | request → route → controller → Eloquent | R | ✅ **precise `Route::get([Ctrl::class,'m'])` / `'Ctrl@m'` → Ctrl@method** (realworld S / firefly M / bookstack L) — was resolving the bare method name to the WRONG controller (every `index`→ArticleController); Route::resource→controller. 🔬 Eloquent dynamic finders/relationships (metaprogramming frontier) |
 | PHP | Drupal | request → *.routing.yml → _controller/_form | R | ✅ **`claimsReference` for FQCN handlers** (`\Drupal\…\Class::method` passed the pre-filter only because the `::method` name was known; bare `_form` FQCNs `\…\FormClass` and single-colon `Class:method` controller-services were dropped before resolve()) + **single-colon controller match** + **detect via composer `type:drupal-*` / `name:drupal/*` + `*.info.yml` fallback** (a contrib module with empty `require` was undetected → 0 routes). admin_toolbar S **0→14 (14/14)** / webform M 208 (**144**) / core L 836 (536→**731, 87%**). Remainder is the **entity-annotation handler frontier** (`_entity_form: type.op` resolves via the entity's PHP `#[ContentEntityType]` handlers, not a direct class). 🔬 **OOP `#[Hook]` attributes** — Drupal 11 moved ~all procedural hooks to attribute methods (core: 418 `#[Hook]` files vs 3 procedural), so the resolver's docblock/`module_hook` detection is obsolete for modern core (0 hook edges) |
 | C/C++ | (callback structs / vtables) | function-pointer dispatch | ? | ⬜ |
-| Dart | Flutter | setState → build | S | ⬜ |
+| Dart | Flutter | setState → build; build → child widgets | S + X | ✅ **setState→build synthesizer** (Dart analog of react-render: a State method whose body calls `setState(` → `build`) gated to `.dart` + **foundational Dart method-range fix** — Dart models a method body as a *sibling* of the signature, so method nodes were signature-only (`end==start`); now `endLine` spans the body (required for ALL body analysis: callees, context slices, the synthesizer's body scan). counter `initState→build`, books `build→BookDetail/BookForm`; widget composition already static (compass_app `build→ErrorIndicator/HomeButton`). Controls unchanged (excalidraw 9,290 / django 302 — the range fix only extends sibling-body grammars). 🔬 MVVM Command/ChangeNotifier dispatch (compass_app — no setState) + `Navigator.push(MaterialPageRoute(builder:))` nav routes |
 | Lua / Luau | (Neovim / Roblox) | event/callback dispatch | S | ⬜ |
 | Scala | (Akka / Play) | actor message → handler | ? | ⬜ |
 
@@ -429,6 +429,22 @@ Status legend: ✅ done+validated · 🔬 hole identified · ⬜ not started.
   `createBrowserRouter([{ path, element }])` (modern v6, used by bulletproof-react) is object-based not JSX — a
   separate frontier; plus a pre-existing Next.js false-positive (`*.config.mjs` in a `pages/` app dir treated
   as a route).
+- **Dart / Flutter (validated 2026-05-23, flutter/samples: counter S / books S / compass_app M) — synthesizer + a foundational extractor fix.**
+  Flutter's reactive hop is `setState(() {…})` re-running `build(context)` — framework-internal, no static edge,
+  so "tap → handler → setState → rebuilt UI" dead-ends at setState (the Dart analog of React's setState→render).
+  Added a `flutter-build` synthesizer channel (Phase 4b): for each Dart class with a `build` method, link every
+  sibling method whose body calls `setState(` → `build` (gated to `.dart`). **But it was blocked by a
+  foundational gap:** Dart models a method body as a *sibling* of the `method_signature` node, so every Dart
+  method node had `endLine == startLine` (signature only) — `sliceLines(start,end)` saw only `void f() {`, never
+  the body. Fixed in the shared `createNode`: when a function/method's resolved body sits beyond the node,
+  extend `endLine` to it (guarded — child-body grammars are a no-op; controls excalidraw 9,290 / django 302
+  unchanged). This fix is foundational, not Flutter-specific — every Dart callee/context/body scan was
+  previously truncated. Result: counter `initState→build`, books `initState→build` + `build→BookDetail/BookForm`.
+  **Widget composition needs no synthesis** — unlike JSX, Dart widgets are explicit constructor calls
+  (`BookDetail(...)`), already static (compass_app `build→ErrorIndicator/HomeButton/_Card`). **Residuals
+  (frontier):** MVVM state management (compass_app uses Command/ChangeNotifier + ListenableBuilder, 0 setState —
+  a different dispatch shape) and `Navigator.push(MaterialPageRoute(builder: (_) => DetailPage()))` navigation
+  (route-as-widget, uncovered).
 - **Difficulty gradient is real:** named-ref dispatch (resolver) is cheap; anonymous
   callback dispatch (synthesizer) is medium; **anonymous-arrow handlers are the hard
   remaining gap** (no identity → need synthesizer link-through-body, not yet built).
