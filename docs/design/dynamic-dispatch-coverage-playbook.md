@@ -189,7 +189,7 @@ Status legend: ✅ done+validated · 🔬 hole identified · ⬜ not started.
 | Swift | Vapor | request → route → controller | ? | ⬜ |
 | C# | ASP.NET | request → controller; DI | ? | ⬜ |
 | Ruby | Rails / Sinatra | request → routes.rb → Controller#action → model | R | ✅ **RESTful `resources`/`resource` routing → controller#action** (realworld S 16 / spree M / forem L), pluralization + only/except + claimsReference; explicit routes fixed to precise `controller#action` too. 🔬 ActiveRecord dynamic finders (`Article.find_by_slug`) — metaprogramming frontier |
-| PHP | Laravel / Drupal | request → controller; events | ? | ⬜ |
+| PHP | Laravel | request → route → controller → Eloquent | R | ✅ **precise `Route::get([Ctrl::class,'m'])` / `'Ctrl@m'` → Ctrl@method** (realworld S / firefly M / bookstack L) — was resolving the bare method name to the WRONG controller (every `index`→ArticleController); Route::resource→controller. 🔬 Eloquent dynamic finders/relationships (metaprogramming frontier) |
 | C/C++ | (callback structs / vtables) | function-pointer dispatch | ? | ⬜ |
 | Dart | Flutter | setState → build | S | ⬜ |
 | Lua / Luau | (Neovim / Roblox) | event/callback dispatch | S | ⬜ |
@@ -291,6 +291,17 @@ Status legend: ✅ done+validated · 🔬 hole identified · ⬜ not started.
   / 6 grep / 82–86s** — fewer reads, fewer greps, faster. No regression (wagtail/saleor route counts
   unchanged — purely additive). Residuals: signals (`post_save`→receiver), DRF viewset CRUD actions
   (inherited from the base class, not in the user's ViewSet), saleor's GraphQL resolvers.
+- **Laravel (validated 2026-05-23, realworld S / firefly M / bookstack L) — route precision fix.** The
+  resolver discarded the controller from the handler: `Route::get([UserController::class,'index'])` /
+  `'UserController@index'` emitted a BARE `index` ref, which name-matching mis-resolved to the WRONG
+  controller (every `index`/`show` → whichever it found first; realworld GET user → ArticleController.index,
+  should be UserController). Fix (`frameworks/laravel.ts`): emit precise `Controller@method` (array + string
+  syntax, namespace-stripped) + `claimsReference` it past the pre-filter → existing Pattern-4
+  `resolveControllerMethod`. realworld all routes correct; bookstack 267/332 precise (GET pages →
+  PageApiController.list). Agent A/B (bookstack page-view, large): codegraph **2–3 reads / 1–2 grep /
+  51–60s** vs without **4–6 / 3–5 / 60–74s**. No node explosion. Residuals: firefly resolves only 3/568
+  (its fluent `->uses()` / `['uses'=>...]` handler format isn't parsed); Eloquent dynamic finders
+  (metaprogramming frontier).
 - **Difficulty gradient is real:** named-ref dispatch (resolver) is cheap; anonymous
   callback dispatch (synthesizer) is medium; **anonymous-arrow handlers are the hard
   remaining gap** (no identity → need synthesizer link-through-body, not yet built).
