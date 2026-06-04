@@ -125,6 +125,7 @@ const INSTANTIATION_KINDS: ReadonlySet<string> = new Set([
   'object_creation_expression',      // java / c#
   'instance_creation_expression',    // some grammars
   'composite_literal',               // go — `Widget{...}` / `pkga.Widget{...}`
+  'struct_expression',               // rust — `Widget { n: 1 }` / `m::Widget { .. }`
 ]);
 
 /**
@@ -1692,6 +1693,14 @@ export class TreeSitterExtractor {
           const parentId = this.nodeStack[this.nodeStack.length - 1];
           if (parentId) this.emitPyFromImportRefs(node, parentId);
         }
+        // Rust `use crate::m::Item;` / `pub use self::sub::Item;` — link each
+        // imported leaf to its definition. Covers `pub use` re-export hubs
+        // (a `mod.rs` re-exporting submodule items, e.g. tokio's `fs/mod.rs`)
+        // and items imported but used in non-call/non-type positions.
+        if (this.language === 'rust' && node.type === 'use_declaration') {
+          const parentId = this.nodeStack[this.nodeStack.length - 1];
+          if (parentId) this.emitRustUseBindingRefs(node, parentId);
+        }
         return;
       }
       // Hook returned null — fall through to multi-import inline handlers only
@@ -1874,6 +1883,66 @@ export class TreeSitterExtractor {
         referenceKind: 'imports',
         line: nameNode.startPosition.row + 1,
         column: nameNode.startPosition.column,
+      });
+    }
+  }
+
+  /**
+   * Emit one `imports` reference per leaf binding of a Rust `use` declaration —
+   * `use crate::m::Item`, `use crate::m::{A, B as C}`, `pub use self::sub::Item`.
+   * The leaf name (the defining symbol, not the local alias) is resolved by the
+   * name-matcher to its definition, so a `pub use` re-export hub (a `mod.rs`
+   * re-exporting submodule items) depends on the modules it re-exports, and a
+   * `use`d item that's only stored/passed (not called/typed) still links.
+   * `use ...::*` and bare `self`/`super`/`crate` segments have no leaf to link.
+   */
+  private emitRustUseBindingRefs(node: SyntaxNode, fromNodeId: string): void {
+    const leaves: SyntaxNode[] = [];
+    const collect = (n: SyntaxNode): void => {
+      switch (n.type) {
+        case 'identifier':
+          leaves.push(n);
+          break;
+        case 'scoped_identifier': {
+          // `a::b::C` → the leaf is the final `name` segment.
+          const name = getChildByField(n, 'name') ?? n.namedChild(n.namedChildCount - 1);
+          if (name && name.type === 'identifier') leaves.push(name);
+          break;
+        }
+        case 'scoped_use_list': {
+          // `path::{ ... }` → recurse into the list; the path prefix isn't a leaf.
+          const list = getChildByField(n, 'list') ?? n.namedChildren.find((c) => c.type === 'use_list');
+          if (list) collect(list);
+          break;
+        }
+        case 'use_list':
+          for (let i = 0; i < n.namedChildCount; i++) {
+            const c = n.namedChild(i);
+            if (c) collect(c);
+          }
+          break;
+        case 'use_as_clause': {
+          // `Path as Alias` → link the source path (the definition), not the alias.
+          const path = getChildByField(n, 'path') ?? n.namedChild(0);
+          if (path) collect(path);
+          break;
+        }
+        // use_wildcard / self / super / crate → no specific leaf to link.
+      }
+    };
+    for (let i = 0; i < node.namedChildCount; i++) {
+      const c = node.namedChild(i);
+      if (c) collect(c);
+    }
+    for (const leaf of leaves) {
+      const name = getNodeText(leaf, this.source);
+      if (!name || name === 'self' || name === 'super' || name === 'crate') continue;
+      this.unresolvedReferences.push({
+        fromNodeId,
+        referenceName: name,
+        referenceKind: 'imports',
+        line: leaf.startPosition.row + 1,
+        column: leaf.startPosition.column,
       });
     }
   }
