@@ -463,7 +463,12 @@ export function matchMethodCall(
   // part allows trailing `:` keywords so Objective-C selectors resolve
   // (`SDImageCache.storeImage:`, `obj.setX:y:`); colons never appear in other
   // languages' method refs, so this is a no-op for them.
-  const dotMatch = ref.referenceName.match(/^(\w+)\.(\w+:?(?:\w+:)*)$/);
+  // The receiver allows dots (`builder.Services.AddCoreServices`) so a CHAINED
+  // call resolves by its last segment — Strategy 3 below name-matches the method
+  // (with its existing single-candidate / receiver-overlap guards). Without this
+  // a multi-dot extension-method call (C# DI `builder.Services.AddCoreServices()`,
+  // `Guard.Against.X()`) matched no pattern and never resolved.
+  const dotMatch = ref.referenceName.match(/^([\w.]+)\.(\w+:?(?:\w+:)*)$/);
   const colonMatch = ref.referenceName.match(/^(\w+)::(\w+)$/);
 
   const match = dotMatch || colonMatch;

@@ -3953,6 +3953,47 @@ describe('Python absolute module import resolution', () => {
   });
 });
 
+describe('Chained method-call resolution (C# extension methods)', () => {
+  let tempDir: string;
+  let cg: CodeGraph;
+
+  beforeEach(() => {
+    tempDir = createTempDir();
+  });
+
+  afterEach(() => {
+    if (cg) cg.close();
+    if (fs.existsSync(tempDir)) fs.rmSync(tempDir, { recursive: true, force: true });
+  });
+
+  it('resolves a chained extension-method call (a.b.Method()) to its definition', async () => {
+    // ASP.NET DI registration: `builder.Services.AddCoreServices(...)` calls a
+    // static extension method elsewhere. A multi-dot receiver chain matched no
+    // method-call pattern before, so the extension method had no caller.
+    fs.mkdirSync(path.join(tempDir, 'cfg'), { recursive: true });
+    fs.writeFileSync(
+      path.join(tempDir, 'cfg/Ext.cs'),
+      `namespace App {\n  public static class Ext {\n    public static object AddCoreServices(this object services, int x) { return services; }\n  }\n}\n`
+    );
+    fs.writeFileSync(
+      path.join(tempDir, 'Program.cs'),
+      `namespace App {\n  public class Program {\n    public void Run(object builder) {\n      builder.Services.AddCoreServices(1);\n    }\n  }\n}\n`
+    );
+
+    cg = CodeGraph.initSync(tempDir);
+    await cg.indexAll();
+    cg.resolveReferences();
+
+    const ext = cg
+      .getNodesByKind('method')
+      .find((n) => n.name === 'AddCoreServices')
+      ?? cg.getNodesByKind('function').find((n) => n.name === 'AddCoreServices');
+    expect(ext, 'AddCoreServices defined').toBeDefined();
+    const callers = [...cg.getImpactRadius(ext!.id, 2).nodes.values()].map((n) => n.filePath ?? '');
+    expect(callers.some((p) => p.endsWith('Program.cs')), 'chained extension call resolves to its definition').toBe(true);
+  });
+});
+
 describe('Same-directory include + KMP import resolution', () => {
   let tempDir: string;
   let cg: CodeGraph;
