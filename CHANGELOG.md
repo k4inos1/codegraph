@@ -11,6 +11,7 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### New Features
 
+- C# types are now tracked by their namespace-qualified name. Same-named types in different namespaces — a domain entity and a DTO both called `CatalogBrand`, say — are told apart instead of collapsing into one arbitrary match, so a reference resolves to the right one and impact no longer conflates them. (C#)
 - ASP.NET Razor (`.cshtml`) and Blazor (`.razor`) markup are now parsed for code relationships. A `@model` / `@inherits` / `@inject` directive links the view to the C# view-model, base type, or service it names; a Blazor `<MyComponent/>` tag (plus `@typeof(...)` and generic `TItem="..."` arguments) links to the component class; and the C# inside `@code { }` / `@functions { }` / `@{ }` blocks is analyzed too, so services and types used in component logic are linked. A view-model, component, or service referenced only from markup is no longer reported as having no dependents, and editing it surfaces the views that use it. (ASP.NET, Blazor)
 - `codegraph status --json` now also reports the running CLI `version`, the index directory (`indexPath`), and a `lastIndexed` timestamp (ISO-8601, or null when nothing's indexed yet), so CI and scripts can pin the CLI version and check index freshness from a single command. A matching `CodeGraph.getLastIndexedAt()` library method exposes the same freshness check without shelling out. Thanks @12122J and @eddieran. (#329)
 

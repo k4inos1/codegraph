@@ -15,6 +15,18 @@ export const csharpExtractor: LanguageExtractor = {
   enumTypes: ['enum_declaration'],
   enumMemberTypes: ['enum_member_declaration'],
   typeAliasTypes: [],
+  // Namespaces qualify type names so same-named types in different namespaces are
+  // distinguishable (e.g. `ApplicationCore.Entities.CatalogBrand` vs
+  // `BlazorShared.Models.CatalogBrand`). Both block (`namespace Foo { … }`, which
+  // nests its types) and file-scoped (`namespace Foo;`) forms — extractFilePackage
+  // pushes the namespace onto the scope so nested/top-level types pick it up.
+  packageTypes: ['namespace_declaration', 'file_scoped_namespace_declaration'],
+  extractPackage: (node: SyntaxNode, source: string) => {
+    const name =
+      node.childForFieldName('name') ??
+      node.namedChildren.find((c: SyntaxNode) => c.type === 'qualified_name' || c.type === 'identifier');
+    return name ? getNodeText(name, source) : null;
+  },
   importTypes: ['using_directive'],
   callTypes: ['invocation_expression'],
   variableTypes: ['local_declaration_statement'],

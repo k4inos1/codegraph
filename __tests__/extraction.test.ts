@@ -4006,6 +4006,21 @@ describe('Razor / Blazor markup extraction', () => {
     expect(htmlNodes.length, 'no node for HTML elements').toBe(0);
   });
 
+  it('C# namespaces qualify type names so same-named types are distinct', async () => {
+    fs.writeFileSync(path.join(tempDir, 'entity.cs'), `namespace App.Entities { public class CatalogBrand { } }`);
+    fs.writeFileSync(path.join(tempDir, 'dto.cs'), `namespace App.Models { public class CatalogBrand { } }`);
+
+    cg = CodeGraph.initSync(tempDir);
+    await cg.indexAll();
+
+    const brands = cg.getNodesByKind('class').filter((n) => n.name === 'CatalogBrand');
+    expect(brands.length, 'both CatalogBrand classes indexed').toBe(2);
+    const qns = brands.map((b) => b.qualifiedName).sort();
+    expect(qns[0]).not.toBe(qns[1]); // distinct qualified names (namespace-scoped)
+    expect(qns.some((q) => q.includes('Entities') && q.endsWith('CatalogBrand'))).toBe(true);
+    expect(qns.some((q) => q.includes('Models') && q.endsWith('CatalogBrand'))).toBe(true);
+  });
+
   it('delegates Blazor @code block C# to cover types used in component logic', async () => {
     fs.writeFileSync(
       path.join(tempDir, 'CatalogService.cs'),
