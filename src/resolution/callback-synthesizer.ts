@@ -1122,6 +1122,85 @@ function expoCrossPlatformEdges(queries: QueryBuilder): Edge[] {
   return edges;
 }
 
+/**
+ * Classic React Native NativeModules cross-platform pairing. A native module
+ * method (`@ReactMethod` on Android, `RCT_EXPORT_METHOD` on iOS) is implemented
+ * on BOTH platforms, but a JS callsite name-resolves to only ONE — so the other
+ * platform's impl looked like nothing called it. A native method that HAS a JS
+ * caller is a confirmed bridge method; link it to the same-named native method
+ * in another language (the other platform's impl) so a JS call reaching one
+ * platform reaches the other, and editing either surfaces the JS caller.
+ *
+ * Names are normalized to the first selector keyword (`getFreeDiskStorage:` →
+ * `getFreeDiskStorage`) — that's the JS-visible name, and how the iOS selector
+ * lines up with the bare Android method name.
+ */
+function rnCrossPlatformEdges(queries: QueryBuilder): Edge[] {
+  const edges: Edge[] = [];
+  const seen = new Set<string>();
+  const NATIVE = new Set(['java', 'kotlin', 'objc', 'cpp']);
+  const JS = new Set(['typescript', 'tsx', 'javascript', 'jsx']);
+  // RN module INFRASTRUCTURE methods exist on every native module (called by the
+  // RN runtime, not user JS), so pairing them by name would cross-link unrelated
+  // modules in a multi-module repo. Skip them — they aren't user-facing methods.
+  const RN_INFRA = new Set([
+    'addListener', 'removeListeners', 'getConstants', 'constantsToExport', 'getName',
+    'invalidate', 'initialize', 'getDefaultEventTypes', 'supportedEvents',
+    'requiresMainQueueSetup', 'methodQueue',
+  ]);
+  const norm = (name: string): string => {
+    const i = name.indexOf(':');
+    return i >= 0 ? name.slice(0, i) : name;
+  };
+
+  // Index native methods by their JS-visible (normalized) name. Only names with
+  // impls in ≥2 native languages can pair, so the per-method JS-caller check
+  // below only runs for genuine cross-platform candidates.
+  const byName = new Map<string, Node[]>();
+  for (const m of queries.iterateNodesByKind('method')) {
+    if (!NATIVE.has(m.language)) continue;
+    const key = norm(m.name);
+    const arr = byName.get(key);
+    if (arr) arr.push(m);
+    else byName.set(key, [m]);
+  }
+
+  for (const [groupName, group] of byName) {
+    if (RN_INFRA.has(groupName)) continue;
+    const langs = new Set(group.map((m) => m.language));
+    if (langs.size < 2) continue; // single-platform — nothing to pair
+    for (const m of group) {
+      // Is m a bridge method? (a JS-language `calls` edge points at it)
+      const incoming = queries.getIncomingEdges(m.id, ['calls']);
+      if (incoming.length === 0) continue;
+      const sources = queries.getNodesByIds(incoming.map((e) => e.source));
+      const isBridge = incoming.some((e) => {
+        const s = sources.get(e.source);
+        return !!s && JS.has(s.language);
+      });
+      if (!isBridge) continue;
+      // Link to the other-platform impls (both directions).
+      for (const sib of group) {
+        if (sib.id === m.id || sib.language === m.language) continue;
+        for (const [a, b] of [[m, sib], [sib, m]] as const) {
+          const key = `${a.id}>${b.id}`;
+          if (seen.has(key)) continue;
+          seen.add(key);
+          edges.push({
+            source: a.id,
+            target: b.id,
+            kind: 'calls',
+            line: a.startLine,
+            provenance: 'heuristic',
+            metadata: { synthesizedBy: 'rn-cross-platform', via: norm(m.name) },
+          });
+        }
+      }
+    }
+  }
+  return edges;
+}
+
 function fabricNativeImplEdges(ctx: ResolutionContext): Edge[] {
   const edges: Edge[] = [];
   const seen = new Set<string>();
@@ -1382,6 +1461,7 @@ export function synthesizeCallbackEdges(queries: QueryBuilder, ctx: ResolutionCo
   const rnEventEdgesList = rnEventEdges(ctx);
   const fabricNativeEdges = fabricNativeImplEdges(ctx);
   const expoXPlatEdges = expoCrossPlatformEdges(queries);
+  const rnXPlatEdges = rnCrossPlatformEdges(queries);
   const mybatisEdges = mybatisJavaXmlEdges(queries);
   const ginEdges = ginMiddlewareChainEdges(queries, ctx);
 
@@ -1402,6 +1482,7 @@ export function synthesizeCallbackEdges(queries: QueryBuilder, ctx: ResolutionCo
     ...rnEventEdgesList,
     ...fabricNativeEdges,
     ...expoXPlatEdges,
+    ...rnXPlatEdges,
     ...mybatisEdges,
     ...ginEdges,
   ]) {
