@@ -109,8 +109,10 @@ dodge this entirely: they're `import`-kind nodes, not `const`/`var`, so never ta
 
 ## Extending to another language
 
-1. Add the language to `VALUE_REF_LANGS` and confirm its declarator node type is
-   `variable_declarator` (or adjust the shadow-prune scan for the grammar's equivalent).
-2. Run the validation matrix above on small/medium/large real repos (public OSS only).
-3. Hunt FPs: bundled/generated files, intra-file shadowing, param reuse. Fix clusters;
-   record singletons. Add a row to the matrix.
+The step-by-step runbook — wiring checklist, validation scripts, FP hunts, per-language
+declarator types, and traps — is in
+[`value-reference-edges-playbook.md`](./value-reference-edges-playbook.md). Point a fresh
+session at it and say "Start on language X." In short: decide whether the language's
+constants are file/module-scope (fits) or class-scope (bigger change); confirm the declarator
+node type for the shadow prune; sweep small/medium/large public OSS repos; fix FP clusters;
+add a matrix row here + a test.
