@@ -165,7 +165,7 @@ Tracked against the README's **Supported Languages** table (24 rows) and **Frame
 Routes** list. Value-refs is **language-level**, so frameworks are *not* a separate axis (see
 the bottom of this section).
 
-**✅ Done — validated S/M/L (7 + 3 inherited):**
+**✅ Done — validated S/M/L (15 + 3 inherited):**
 
 | Language | How |
 |---|---|
