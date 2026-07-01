@@ -632,16 +632,23 @@ program
       }
 
       const { default: CodeGraph } = await loadCodeGraph();
-      const cg = await CodeGraph.open(projectPath);
+      // `index` is a FULL re-index — identical to a fresh `init`. RECREATE the
+      // database from scratch (discard .codegraph/codegraph.db + its WAL) rather
+      // than opening the old graph and DELETE-ing every row. The clear-then-index
+      // approach reported "0 nodes" without the clear (#874); the recreate keeps
+      // that fixed AND avoids the failure mode where, on a large or pre-fix
+      // poisoned index, the per-row FTS delete churn wedged the main thread long
+      // enough to trip the liveness watchdog before scanning even began (#1067).
+      // recreate() hands back a fresh, empty instance — no clear() needed. For
+      // fast incremental updates use `sync`.
+      const cg = await CodeGraph.recreate(projectPath);
 
       // Supervise the indexer: self-terminate if orphaned (parent shim killed)
       // or if the main thread wedges — neither was guarded on this path (#999).
       const supervision = installCommandSupervision('index');
       try {
         if (options.quiet) {
-          // Quiet mode: no UI, just run. `index` is a full re-index, so clear the
-          // existing graph and rebuild from scratch (see the note below — #874).
-          cg.clear();
+          // Quiet mode: no UI, just run against the freshly-recreated graph.
           const result = await cg.indexAll();
           if (!result.success) process.exit(1);
           cg.destroy();
@@ -650,13 +657,6 @@ program
 
         const clack = await importESM('@clack/prompts');
         clack.intro('Indexing project');
-
-        // `index` is a FULL re-index: clear the existing graph and rebuild it from
-        // scratch so the result is identical to a fresh `init`. Without the clear,
-        // indexAll() skips every unchanged file by its content hash and reports
-        // "0 nodes, 0 edges" against the already-populated graph — which reads as
-        // "index wiped my index" (#874). For fast incremental updates use `sync`.
-        cg.clear();
 
         let result: IndexResult;
 
@@ -964,15 +964,18 @@ program
         } else {
           console.log(chalk.bold(`\nSearch Results for "${search}":\n`));
 
+          // Results arrive already ranked by relevance, so the order conveys
+          // it. We don't print the raw score: it's an unbounded BM25/FTS value
+          // (relative-ranking only), and the old `(score * 100)%` rendered it
+          // as nonsensical percentages like "12042%" (#1045). The MCP search
+          // tool likewise shows no score. Raw `score` stays in --json output.
           for (const result of results) {
             const node = result.node;
             const location = `${node.filePath}:${node.startLine}`;
-            const score = chalk.dim(`(${(result.score * 100).toFixed(0)}%)`);
 
             console.log(
               chalk.cyan(node.kind.padEnd(12)) +
-              chalk.white(node.name) +
-              ' ' + score
+              chalk.white(node.name)
             );
             console.log(chalk.dim(`  ${location}`));
             if (node.signature) {
@@ -1140,21 +1143,32 @@ program
   });
 
 /**
- * codegraph node <name>
+ * codegraph node [name]
  *
  * The CLI face of the MCP codegraph_node tool: one symbol's source +
  * caller/callee trail, or a whole file with line numbers + dependents
  * (Read-parity). Same subagent/non-MCP rationale as `explore`.
+ *
+ * `name` is OPTIONAL because `--file` (file-read mode) carries no symbol —
+ * a required `<name>` made `codegraph node -f <file>` unreachable (#1044).
  */
 program
-  .command('node <name>')
+  .command('node [name]')
   .description('One symbol\'s source + caller/callee trail, or read a file with line numbers + dependents (same output as the codegraph_node MCP tool)')
   .option('-p, --path <path>', 'Project path')
   .option('-f, --file <file>', 'Treat as file mode (or disambiguate a symbol to this file)')
   .option('--offset <number>', 'File mode: 1-based start line')
   .option('--limit <number>', 'File mode: maximum lines')
   .option('--symbols-only', 'File mode: just the symbol map + dependents')
-  .action(async (name: string, options: { path?: string; file?: string; offset?: string; limit?: string; symbolsOnly?: boolean }) => {
+  .action(async (name: string | undefined, options: { path?: string; file?: string; offset?: string; limit?: string; symbolsOnly?: boolean }) => {
+    // Need a symbol (positional) OR a file (--file / a path-like positional).
+    // With [name] optional, a bare `codegraph node` reaches here with neither
+    // and must be told what to pass, rather than crashing downstream.
+    if (!name && !options.file) {
+      error("Pass a symbol name (e.g. 'codegraph node parseToken') or a file (e.g. 'codegraph node -f src/auth.ts', or 'codegraph node src/auth.ts').");
+      process.exit(1);
+    }
+
     const projectPath = resolveProjectPath(options.path);
 
     try {
@@ -1177,9 +1191,9 @@ program
       if (options.file) {
         args.file = options.file;
         if (name && name !== options.file) args.symbol = name;
-      } else if (name.includes('/') || name.includes('\\')) {
+      } else if (name && (name.includes('/') || name.includes('\\'))) {
         args.file = name.replace(/\\/g, '/');
-      } else {
+      } else if (name) {
         args.symbol = name;
         args.includeCode = true;
       }

@@ -168,12 +168,35 @@ const DEFAULT_IGNORE_DIRS: ReadonlySet<string> = new Set([
   '.cache',
 ]);
 
+/**
+ * Android resource directory types. A `res/` tree holds ONLY non-code resources —
+ * layouts, drawables, value bags (strings/colors/styles), menus, navigation
+ * graphs — split into one typed subdirectory per kind, optionally density/locale/
+ * version-qualified (`values-es`, `drawable-hdpi`, `layout-v21`, …). None of it
+ * yields an extractable code symbol, yet on an Android app it DOMINATES the tree
+ * (one report: 26k XML files = 97% of the project, 0 symbols), bloating the DB,
+ * slowing indexing, and skewing both the file count and `codegraph_explore`
+ * results (#1047). So these are excluded by default. The structure is
+ * self-identifying — a non-Android project has no `res/layout/` etc., so it's
+ * untouched — and the only XML that DOES produce symbols (MyBatis mappers) lives
+ * under `src/main/resources/`, never `res/`, so nothing useful is dropped.
+ * `res/raw/` is deliberately NOT here: it holds arbitrary bundled assets that can
+ * be code-ish (a `.sql` schema, a `.js`), so we leave it indexed. Override any of
+ * these with a `.gitignore` negation (e.g. `!res/values/`).
+ */
+const ANDROID_RES_TYPES: readonly string[] = [
+  'anim', 'animator', 'color', 'drawable', 'font', 'layout',
+  'menu', 'mipmap', 'navigation', 'transition', 'values', 'xml',
+];
+
 /** Gitignore-style patterns for the `ignore` matcher: the dirs above plus a few globs. */
 const DEFAULT_IGNORE_PATTERNS: string[] = [
   ...Array.from(DEFAULT_IGNORE_DIRS, (d) => `${d}/`),
   '*.egg-info/',     // Python packaging metadata
   'cmake-build-*/',  // CLion / CMake build trees
   'bazel-*/',        // Bazel output symlink trees
+  // Android resource dirs at any depth, with their qualifier variants (#1047).
+  ...ANDROID_RES_TYPES.map((t) => `**/res/${t}*/`),
 ];
 
 /** True if `buf` decodes as strict UTF-8 (no invalid byte sequences). */
@@ -489,6 +512,40 @@ export function buildScopeIgnore(rootDir: string, embeddedRoots?: Iterable<strin
 }
 
 /**
+ * Whether an embedded repo found as a tracked gitlink (mode 160000, #1031/#1033)
+ * must be SKIPPED rather than indexed. A gitlink is tracked, so `.gitignore`
+ * can't untrack it — but the discovery passes for it must still honor the same
+ * scope rules as every other path, or a gitignored reference/data dir full of
+ * `git add`ed clones gets pulled into the index against the user's stated intent
+ * (#1065). Two reasons to skip:
+ *   1. It sits in a built-in default-ignored location — an npm git-dependency
+ *      under `node_modules` is never project code; not even an explicit opt-in
+ *      revives it (matches `findIgnoredEmbeddedRepos`).
+ *   2. The parent repo's own `.gitignore` covers its path and the project did
+ *      NOT opt that path in via `codegraph.json` `includeIgnored`. The gitignore
+ *      rule is the user's stated intent to keep that path out of scope, exactly
+ *      as for an UNtracked embedded repo — respect it by default, opt back in
+ *      with `includeIgnored` (#514, #970, #976).
+ * `relDir` is repoDir-relative (trailing-slashed); `prefix` is repoDir's
+ * scan-root-relative path so the `includeIgnored` pattern is matched on the full
+ * scan-root-relative path. `defaults` is `defaultsOnlyIgnore()` and `repoIgnore`
+ * is `buildDefaultIgnore(repoDir)` (defaults + the repo's own `.gitignore`),
+ * both passed in so they're built once per repo level rather than per gitlink.
+ */
+function gitlinkEmbeddedRepoSkipped(
+  relDir: string,
+  prefix: string,
+  defaults: Ignore,
+  repoIgnore: Ignore,
+  includeIgnored: Ignore | null,
+): boolean {
+  if (defaults.ignores(relDir)) return true;        // default-ignored — never index, opt-in can't revive
+  if (!repoIgnore.ignores(relDir)) return false;    // not ignored at all — index as before (#1031/#1033)
+  // Gitignored by the repo's own rules — skip unless the project opted it in.
+  return !includeIgnored?.ignores(normalizePath(prefix + relDir));
+}
+
+/**
  * Standalone discovery of every embedded repo root under `rootDir` (relative,
  * trailing-slashed) — the untracked kind (#193) always, and the gitignored kind
  * (#514) only for directories the project opted in via `codegraph.json`
@@ -520,6 +577,30 @@ export function discoverEmbeddedRepoRoots(rootDir: string): string[] {
         }
       }
     } catch { /* untracked listing failed — ignored-side discovery still runs */ }
+    // Unexpanded gitlinks (mode 160000) with a real checkout on disk — embedded
+    // repos `git add`ed without `.gitmodules`, or submodules not active here. The
+    // untracked listing above can't see them (they're tracked), so find them the
+    // same way collectGitFiles does, keeping watcher scope == indexer scope.
+    // (#1031, #1033)
+    try {
+      const staged = execFileSync(
+        'git',
+        ['ls-files', '-z', '-s', '--recurse-submodules'],
+        { cwd: repoAbs, encoding: 'utf-8', timeout: 30000, maxBuffer: 50 * 1024 * 1024, stdio: ['pipe', 'pipe', 'pipe'], windowsHide: true }
+      );
+      const repoIgnore = buildDefaultIgnore(repoAbs);
+      for (const entry of staged.split('\0')) {
+        if (!entry || entry.slice(0, 6) !== '160000') continue;
+        const tab = entry.indexOf('\t');
+        if (tab === -1) continue;
+        const rel = entry.slice(tab + 1);
+        const relDir = rel.endsWith('/') ? rel : rel + '/';
+        // A gitlink under a gitignored path is respected (not indexed) unless the
+        // project opted it in — same rule as the untracked-ignored kind (#1065).
+        if (gitlinkEmbeddedRepoSkipped(relDir, prefix, defaults, repoIgnore, includeIgnored)) continue;
+        if (classifyGitDir(path.join(repoAbs, rel)) === 'embedded') candidates.push(relDir);
+      }
+    } catch { /* staged listing failed — other discovery still runs */ }
     candidates.push(...findIgnoredEmbeddedRepos(repoAbs, includeIgnored, prefix));
     for (const rel of candidates) {
       const full = normalizePath(prefix + rel);
@@ -585,13 +666,35 @@ function collectGitFiles(repoDir: string, prefix: string, files: Set<string>, em
   // Without this, monorepos using submodules index 0 files. (See issue #147.)
   // Note: --recurse-submodules only supports -c/--cached and --stage modes — it
   // can't be combined with -o, so untracked files are gathered separately below.
+  //
+  // We use --stage (-s) rather than -c so each entry carries its file mode. That
+  // lets us spot gitlink entries (mode 160000) that --recurse-submodules did NOT
+  // expand: a nested repo `git add`ed without a `.gitmodules` entry, or a
+  // submodule that isn't active/initialized in this checkout. Such a gitlink
+  // falls through every pass — it's tracked, so the untracked `-o` listing below
+  // never reports it, and --recurse-submodules only expands ACTIVE submodules —
+  // so its source would be silently skipped, leaving only the super-repo's own
+  // files indexed. We collect those gitlinks here and recurse into them below.
+  // (An active submodule is expanded inline by --recurse-submodules and so never
+  // surfaces as a 160000 entry — only the unhandled gitlinks do.) (#1031, #1033)
+  //
   // -z gives NUL-separated, unquoted output so non-ASCII (e.g. CJK) paths
   // survive verbatim. Without it git octal-escapes and double-quotes such paths
   // (the core.quotepath default), and the quoted form never matches a real file
-  // on disk → those files are silently dropped from the index. (#541)
-  const tracked = execFileSync('git', ['ls-files', '-z', '-c', '--recurse-submodules'], gitOpts);
-  for (const rel of tracked.split('\0')) {
-    if (rel) files.add(normalizePath(prefix + rel));
+  // on disk → those files are silently dropped from the index. (#541) With -s the
+  // path follows a TAB after the `<mode> <object> <stage>` prefix.
+  const gitlinkRels: string[] = [];
+  const tracked = execFileSync('git', ['ls-files', '-z', '-s', '--recurse-submodules'], gitOpts);
+  for (const entry of tracked.split('\0')) {
+    if (!entry) continue;
+    const tab = entry.indexOf('\t');
+    if (tab === -1) continue; // --stage always emits "<mode> <object> <stage>\t<path>"
+    const rel = entry.slice(tab + 1);
+    if (entry.slice(0, 6) === '160000') {
+      gitlinkRels.push(rel); // an unexpanded gitlink — recursed into below, not a source file itself
+      continue;
+    }
+    files.add(normalizePath(prefix + rel));
   }
 
   // Untracked files (submodules manage their own untracked state). Embedded git
@@ -616,6 +719,31 @@ function collectGitFiles(repoDir: string, prefix: string, files: Set<string>, em
       continue;
     }
     files.add(normalizePath(prefix + rel));
+  }
+
+  // Gitlink entries (mode 160000) that --recurse-submodules left unexpanded —
+  // an embedded repo `git add`ed without `.gitmodules`, or a submodule not
+  // active/initialized in this checkout. When such a gitlink has a real working
+  // tree on disk it is distinct first-party code we must index as its own
+  // embedded repo: the tracked pass skipped its contents and the untracked pass
+  // never sees it (it's tracked, not "other"). A gitlink with no checkout on disk
+  // (an uninitialized submodule — empty dir, no `.git`) has nothing to index and
+  // is left alone, as is a submodule worktree (a duplicate view, #945). (#1031, #1033)
+  if (gitlinkRels.length > 0) {
+    const defaults = defaultsOnlyIgnore();
+    const repoIgnore = buildDefaultIgnore(repoDir);
+    for (const rel of gitlinkRels) {
+      const relDir = rel.endsWith('/') ? rel : rel + '/';
+      // A gitlink under a gitignored path is respected (not indexed) unless the
+      // project opted it in via `includeIgnored` — keep tracked gitlinks under
+      // the same scope rule as the untracked-ignored kind below (#1065).
+      if (gitlinkEmbeddedRepoSkipped(relDir, prefix, defaults, repoIgnore, includeIgnored)) continue;
+      const childDir = path.join(repoDir, rel);
+      // 'embedded' = a real .git checkout on disk; 'worktree' and 'none' are skipped.
+      if (classifyGitDir(childDir) !== 'embedded') continue;
+      embeddedRoots?.add(normalizePath(prefix + relDir));
+      collectGitFiles(childDir, prefix + relDir, files, embeddedRoots, includeIgnored);
+    }
   }
 
   // Embedded repos hidden by THIS repo's ignore rules (`/packages/` in a

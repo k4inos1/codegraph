@@ -21,6 +21,7 @@ import { FN_REF_SPECS, captureFnRefCandidates, type FnRefSpec, type FnRefCandida
 import { isGeneratedFile } from './generated-detection';
 import type { LanguageExtractor, ExtractorContext } from './tree-sitter-types';
 import { EXTRACTORS } from './languages';
+import { stripCppTemplateArgs } from './languages/c-cpp';
 import { LiquidExtractor } from './liquid-extractor';
 import { RazorExtractor } from './razor-extractor';
 import { SvelteExtractor } from './svelte-extractor';
@@ -62,18 +63,42 @@ const VUE_STORE_FILE_SIGNAL = /\bdefineStore\b|\bcreateStore\b|\bVuex\b|\bmutati
  * Extract the name from a node based on language
  */
 function extractName(node: SyntaxNode, source: string, extractor: LanguageExtractor): string {
+  const name = extractNameRaw(node, source, extractor);
+  // Universal fallback: recover a real identifier from a name still mangled by a
+  // macro the pre-parse didn't blank (C/C++ only — see recoverMangledName). A
+  // no-op on well-formed names, so a clean name is never altered.
+  return extractor.recoverMangledName ? extractor.recoverMangledName(name) : name;
+}
+
+function extractNameRaw(node: SyntaxNode, source: string, extractor: LanguageExtractor): string {
   const hookName = extractor.resolveName?.(node, source);
   if (hookName) return hookName;
 
   // Try field name first
   const nameNode = getChildByField(node, extractor.nameField);
   if (nameNode) {
-    // Unwrap pointer_declarator(s) for C/C++ pointer return types
+    // Unwrap pointer_declarator / reference_declarator for C/C++ pointer and
+    // reference return types (`int* f()`, `int& f()`, `int&& f()`). Without
+    // unwrapping the reference wrapper an inline reference-returning method is
+    // named "& f() const" instead of "f" — common in Unreal Engine gameplay
+    // headers (`const FGameplayTagContainer& GetActiveTags() const`). Out-of-line
+    // defs (`T& C::f()`) already resolve via the qualified-name hook. A
+    // pointer_declarator exposes its inner through a `declarator` field; a
+    // reference_declarator has none, so it's reached via namedChild(0).
     let resolved = nameNode;
-    while (resolved.type === 'pointer_declarator') {
+    while (resolved.type === 'pointer_declarator' || resolved.type === 'reference_declarator') {
       const inner = getChildByField(resolved, 'declarator') || resolved.namedChild(0);
       if (!inner) break;
       resolved = inner;
+    }
+    // C++ user-defined conversion operator: the declarator is an `operator_cast`
+    // whose first child is the target type and second is the `() const` tail. Name
+    // it `operator <type>` (the conventional spelling) rather than the whole
+    // `operator EALSMovementState() const` declarator, so it matches symbolic
+    // overloads (`operator+`) and is findable by the type name.
+    if (resolved.type === 'operator_cast') {
+      const typeNode = resolved.namedChild(0);
+      return typeNode ? `operator ${getNodeText(typeNode, source).trim()}` : getNodeText(resolved, source);
     }
     // Handle complex declarators (C/C++)
     if (resolved.type === 'function_declarator' || resolved.type === 'declarator') {
@@ -1527,6 +1552,15 @@ export class TreeSitterExtractor {
   private extractClass(node: SyntaxNode, kind: NodeKind = 'class'): void {
     if (!this.extractor) return;
 
+    // Skip forward declarations / elaborated type references (`class Foo;`) in
+    // languages that opt in — bodiless there means "not a definition", so it
+    // would otherwise mint a phantom node competing with the real definition
+    // (#1093). Languages where a bodiless class is complete (Kotlin, Scala)
+    // leave the flag unset. Resolved once here and reused for the body walk.
+    const resolvedBody = this.extractor.resolveBody?.(node, this.extractor.bodyField)
+      ?? getChildByField(node, this.extractor.bodyField);
+    if (this.extractor.skipBodilessClass && !resolvedBody) return;
+
     const name = extractName(node, this.source, this.extractor);
     const docstring = getPrecedingDocstring(node, this.source);
     const visibility = this.extractor.getVisibility?.(node);
@@ -1550,9 +1584,7 @@ export class TreeSitterExtractor {
 
     // Push to stack and visit body
     this.nodeStack.push(classNode.id);
-    let body = this.extractor.resolveBody?.(node, this.extractor.bodyField)
-      ?? getChildByField(node, this.extractor.bodyField);
-    if (!body) body = node;
+    const body = resolvedBody ?? node;
 
     // Visit all children for methods and properties
     for (let i = 0; i < body.namedChildCount; i++) {
@@ -3882,6 +3914,47 @@ export class TreeSitterExtractor {
   }
 
   /**
+   * Is this C++ `declaration` a stack/direct-initialization object construction
+   * that invokes a constructor — `Calculator calc(0)` (direct-init) or
+   * `Widget w{1, 2}` (brace-init) — as opposed to a plain variable or a
+   * function declaration? Used to emit an `instantiates` edge for the
+   * call-less construction syntax (#1035); heap `new T(...)` is handled
+   * separately by INSTANTIATION_KINDS.
+   *
+   * Two signals, both required:
+   *  - the `type` field is a class-like NAMED type (`type_identifier`,
+   *    `template_type`, or `qualified_identifier`). Primitives (`int x(0)`),
+   *    `auto` (`placeholder_type_specifier` — that form always carries a real
+   *    `call_expression`, already handled), and sized specifiers are excluded —
+   *    they construct no class; and
+   *  - a declarator carries constructor arguments: an `init_declarator` whose
+   *    `value` is an `argument_list` (`(args)`) or `initializer_list` (`{args}`).
+   *    This skips default construction `Calculator c;` (no value) and the
+   *    most-vexing-parse `Calculator c();` (a bodyless `function_declarator`,
+   *    a function decl — not a construction).
+   */
+  private isCppStackConstruction(node: SyntaxNode): boolean {
+    const typeNode = getChildByField(node, 'type');
+    if (
+      !typeNode ||
+      (typeNode.type !== 'type_identifier' &&
+        typeNode.type !== 'template_type' &&
+        typeNode.type !== 'qualified_identifier')
+    ) {
+      return false;
+    }
+    for (let i = 0; i < node.namedChildCount; i++) {
+      const child = node.namedChild(i);
+      if (child?.type !== 'init_declarator') continue;
+      const value = getChildByField(child, 'value');
+      if (value && (value.type === 'argument_list' || value.type === 'initializer_list')) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  /**
    * Static-member / value-read pass. A type/enum/class used only via a member
    * VALUE — `Enum.value`, `Type.CONST`, `Colors.red`, `Foo::BAR` — recorded no
    * edge, because the body walker only handled CALLS (`Type.method()`). So a
@@ -4258,6 +4331,19 @@ export class TreeSitterExtractor {
         }
       }
 
+      // C++ stack / direct-initialization construction — `Calculator calc(0)`
+      // and `Widget w{1, 2}`. Unlike heap `new Calculator(0)` (a new_expression
+      // handled above), these carry the constructor arguments directly on the
+      // declarator with NO call/new node, so the body walker saw no constructor
+      // invocation and recorded no `instantiates` edge (#1035). A declaration's
+      // `type` field IS the constructed class name, so reuse extractInstantiation
+      // (which strips template args / namespace and emits the `instantiates`
+      // ref). Children still recurse below, so a nested ctor-arg call
+      // (`Calculator calc(make())`) keeps its own `calls` ref.
+      if (nodeType === 'declaration' && this.language === 'cpp' && this.isCppStackConstruction(node)) {
+        this.extractInstantiation(node);
+      }
+
       // Static-member / value-read: `Enum.value`, `Type.CONST`, `Foo::BAR`.
       this.extractStaticMemberRef(node);
 
@@ -4455,7 +4541,11 @@ export class TreeSitterExtractor {
 
       // C++ base classes: `class Derived : public Base, private Other` →
       // base_class_clause holds access specifiers + base type(s). Emit an extends
-      // ref per base type (skip the public/private/protected keywords).
+      // ref per base type (skip the public/private/protected keywords). A
+      // templated base (`Base<int>`, `ns::Tpl<int>`) arrives as a `template_type`
+      // or a `qualified_identifier` wrapping one; strip the `<…>` args so the ref
+      // matches the bare class the template was defined as — `Base`, `ns::Tpl` —
+      // instead of never resolving (#1043).
       if (child.type === 'base_class_clause') {
         for (const t of child.namedChildren) {
           if (
@@ -4465,7 +4555,7 @@ export class TreeSitterExtractor {
           ) {
             this.unresolvedReferences.push({
               fromNodeId: classId,
-              referenceName: getNodeText(t, this.source),
+              referenceName: stripCppTemplateArgs(getNodeText(t, this.source)),
               referenceKind: 'extends',
               line: t.startPosition.row + 1,
               column: t.startPosition.column,
