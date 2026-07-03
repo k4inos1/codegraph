@@ -139,30 +139,39 @@ function emitRefFromVariableExpr(
 
   const line = varExpr.startPosition.row + 1;
   const col = varExpr.startPosition.column;
-  const qname = qualifyReference(head, attrs);
-  if (qname) onRef(qname, line, col);
+  for (const qname of qualifyReference(head, attrs)) onRef(qname, line, col);
 }
 
-function qualifyReference(head: string, attrs: string[]): string | null {
+function qualifyReference(head: string, attrs: string[]): string[] {
   switch (head) {
     case 'var':
       // var.X — variable "X"
-      return attrs[0] ? `var.${attrs[0]}` : null;
+      return attrs[0] ? [`var.${attrs[0]}`] : [];
     case 'local':
       // local.K — locals attribute K
-      return attrs[0] ? `local.${attrs[0]}` : null;
+      return attrs[0] ? [`local.${attrs[0]}`] : [];
     case 'module':
-      // module.M[.OUTPUT] — module "M"
-      return attrs[0] ? `module.${attrs[0]}` : null;
+      // module.M[.OUTPUT] — module "M". A two-segment chain (`module.M.out`)
+      // additionally emits a scoped `module.M:output.out` ref that the
+      // Terraform resolver bridges to the `output "out"` node inside the
+      // module's source directory — the edge that carries impact across the
+      // module boundary instead of dead-ending at the declaration. Only the
+      // Terraform framework resolver understands the `:`-scoped spelling; if
+      // the module's source is a registry/git address the ref simply stays
+      // unresolved and the boundary remains visible.
+      if (!attrs[0]) return [];
+      return attrs[1]
+        ? [`module.${attrs[0]}`, `module.${attrs[0]}:output.${attrs[1]}`]
+        : [`module.${attrs[0]}`];
     case 'data':
       // data.TYPE.NAME[.ATTR] — data "TYPE" "NAME"
-      return attrs[0] && attrs[1] ? `data.${attrs[0]}.${attrs[1]}` : null;
+      return attrs[0] && attrs[1] ? [`data.${attrs[0]}.${attrs[1]}`] : [];
     default:
       // <type>.<name>[.<attr>...] — managed resource (e.g. aws_s3_bucket.my)
       // Skip plain identifiers with no dotted chain — those are function calls,
       // local-only variables, or template params.
-      if (!attrs[0]) return null;
-      return `${head}.${attrs[0]}`;
+      if (!attrs[0]) return [];
+      return [`${head}.${attrs[0]}`];
   }
 }
 
@@ -186,6 +195,29 @@ export const terraformExtractor: LanguageExtractor = {
 
   visitNode: (node, ctx) => {
     if (node.type !== 'block') {
+      // .tfvars files carry no blocks — just top-level `name = value`
+      // assignments, each of which SETS the root module variable of that
+      // name. Reference the variable from the file node so "what sets
+      // var.region" is answerable from the graph.
+      if (
+        node.type === 'attribute' &&
+        ctx.filePath.endsWith('.tfvars') &&
+        node.parent?.type === 'body' &&
+        node.parent.parent?.type === 'config_file'
+      ) {
+        const idNode = node.namedChildren.find((c) => c?.type === 'identifier');
+        const fileNodeId = ctx.nodeStack[0];
+        if (idNode && fileNodeId) {
+          ctx.addUnresolvedReference({
+            fromNodeId: fileNodeId,
+            referenceName: `var.${getNodeText(idNode, ctx.source)}`,
+            referenceKind: 'references',
+            line: node.startPosition.row + 1,
+            column: node.startPosition.column,
+          });
+        }
+        return true;
+      }
       // Let the default walker descend into bodies/expressions; we only claim
       // top-level blocks.
       return false;
@@ -228,6 +260,9 @@ export const terraformExtractor: LanguageExtractor = {
       ctx.pushScope(created.id);
       try {
         emitReferencesInBody(body, ctx, created.id);
+        if (type === 'module' && labels[0]) {
+          emitModuleWiring(labels[0], node, body, ctx, created.id);
+        }
       } finally {
         ctx.popScope();
       }
@@ -235,6 +270,78 @@ export const terraformExtractor: LanguageExtractor = {
     return true;
   },
 };
+
+/**
+ * Module meta-arguments — attributes of a `module` block that configure the
+ * call itself rather than set one of the child module's input variables.
+ */
+const MODULE_META_ARGS = new Set(['source', 'version', 'count', 'for_each', 'providers', 'depends_on']);
+
+/**
+ * Bridge a `module "M" { ... }` block across the module boundary with
+ * `:`-scoped references that only the Terraform framework resolver
+ * understands (a plain qualified name would let the generic matcher bind
+ * them to a same-named symbol in an unrelated module — a wrong edge is
+ * worse than none):
+ *
+ *   - `module.M:file`      (imports)    → the module source directory's
+ *     entry file, when `source` is a local `./`/`../` path. Registry and
+ *     git sources emit nothing — an out-of-repo module stays a visible
+ *     boundary instead of a guessed edge.
+ *   - `module.M:var.<in>`  (references) → the child module's
+ *     `variable "<in>"` node, one per input attribute. This is what lets
+ *     "what depends on modules/vpc's var.cidr" reach the callers.
+ */
+function emitModuleWiring(
+  moduleName: string,
+  block: SyntaxNode,
+  body: SyntaxNode,
+  ctx: Parameters<NonNullable<LanguageExtractor['visitNode']>>[1],
+  fromNodeId: string
+): void {
+  for (const attr of body.namedChildren) {
+    if (!attr || attr.type !== 'attribute') continue;
+    const idNode = attr.namedChildren.find((c) => c?.type === 'identifier');
+    if (!idNode) continue;
+    const attrName = getNodeText(idNode, ctx.source);
+    if (attrName === 'source') {
+      const expr = attr.namedChildren.find((c) => c?.type === 'expression');
+      const lit = expr ? findStringLit(expr) : null;
+      const source = lit ? stringLitValue(lit, ctx.source) : '';
+      if (source.startsWith('./') || source.startsWith('../')) {
+        ctx.addUnresolvedReference({
+          fromNodeId,
+          referenceName: `module.${moduleName}:file`,
+          referenceKind: 'imports',
+          line: block.startPosition.row + 1,
+          column: block.startPosition.column,
+        });
+      }
+      continue;
+    }
+    if (MODULE_META_ARGS.has(attrName)) continue;
+    ctx.addUnresolvedReference({
+      fromNodeId,
+      referenceName: `module.${moduleName}:var.${attrName}`,
+      referenceKind: 'references',
+      line: attr.startPosition.row + 1,
+      column: attr.startPosition.column,
+    });
+  }
+}
+
+/** First string_lit anywhere under an expression (source = "./modules/x"). */
+function findStringLit(expr: SyntaxNode): SyntaxNode | null {
+  const queue: SyntaxNode[] = [expr];
+  while (queue.length) {
+    const n = queue.shift()!;
+    if (n.type === 'string_lit') return n;
+    for (const c of n.namedChildren) {
+      if (c) queue.push(c);
+    }
+  }
+  return null;
+}
 
 interface BlockDecl {
   kind: 'class' | 'module' | 'variable' | 'namespace';

@@ -9960,16 +9960,21 @@ terraform {
     });
 
     it('should index .tfvars top-level attributes via the same parser path', () => {
-      // .tfvars files have no blocks — just bare attributes. Confirm we don't
-      // crash and that the file is still tracked (file node present).
+      // .tfvars files have no blocks — just bare attributes, each of which
+      // SETS the root module variable of that name. No symbols are declared,
+      // but every top-level assignment references its variable so "what sets
+      // var.region" is answerable.
       const code = `
 region      = "us-east-1"
 environment = "prod"
 `;
       const result = extractFromSource('terraform.tfvars', code);
-      // No symbols expected (tfvars has no declarations we extract), but the
-      // file must still parse cleanly with zero errors.
       expect(result.errors.filter((e) => e.severity === 'error')).toHaveLength(0);
+      const symbols = result.nodes.filter((n) => n.kind !== 'file');
+      expect(symbols).toHaveLength(0);
+      const refs = result.unresolvedReferences.map((r) => r.referenceName);
+      expect(refs).toContain('var.region');
+      expect(refs).toContain('var.environment');
     });
   });
 
@@ -9995,6 +10000,72 @@ output "vpc_id" {
       const result = extractFromSource('outputs.tf', code);
       const refs = result.unresolvedReferences.map((r) => r.referenceName);
       expect(refs).toContain('module.vpc');
+    });
+
+    it('should emit a scoped module.M:output.X ref alongside module.M for output chains', () => {
+      const code = `
+output "vpc_id" {
+  value = module.vpc.vpc_id
+}
+`;
+      const result = extractFromSource('outputs.tf', code);
+      const refs = result.unresolvedReferences.map((r) => r.referenceName);
+      expect(refs).toContain('module.vpc:output.vpc_id');
+      // A bare module.M use (no output segment) stays a single ref.
+      const bare = extractFromSource('main.tf', 'output "m" {\n  value = module.vpc\n}\n');
+      const bareRefs = bare.unresolvedReferences.map((r) => r.referenceName);
+      expect(bareRefs).toContain('module.vpc');
+      expect(bareRefs.some((r) => r.includes(':output.'))).toBe(false);
+    });
+
+    it('should wire module blocks: scoped input refs, meta-args skipped, local source imported', () => {
+      const code = `
+module "vpc" {
+  source     = "./modules/vpc"
+  version    = "1.0.0"
+  count      = 2
+  depends_on = [aws_iam_role.net]
+  cidr       = var.vpc_cidr
+  name       = "prod"
+}
+`;
+      const result = extractFromSource('main.tf', code);
+      const refs = result.unresolvedReferences.map((r) => r.referenceName);
+      // Input attributes wire to the child module's variables (scoped spelling).
+      expect(refs).toContain('module.vpc:var.cidr');
+      expect(refs).toContain('module.vpc:var.name');
+      // Meta-arguments configure the call, not child variables.
+      expect(refs).not.toContain('module.vpc:var.source');
+      expect(refs).not.toContain('module.vpc:var.version');
+      expect(refs).not.toContain('module.vpc:var.count');
+      expect(refs).not.toContain('module.vpc:var.depends_on');
+      // A local ./ source emits the module→file imports ref.
+      const fileRef = result.unresolvedReferences.find((r) => r.referenceName === 'module.vpc:file');
+      expect(fileRef).toBeDefined();
+      expect(fileRef?.referenceKind).toBe('imports');
+      // Attribute VALUES still reference the parent scope as before.
+      expect(refs).toContain('var.vpc_cidr');
+      expect(refs).toContain('aws_iam_role.net');
+    });
+
+    it('should not emit a module.M:file ref for registry or git sources', () => {
+      const code = `
+module "s3" {
+  source  = "terraform-aws-modules/s3-bucket/aws"
+  version = "4.0.0"
+  bucket  = "x"
+}
+module "net" {
+  source = "git::https://example.com/net.git"
+  cidr   = "10.0.0.0/16"
+}
+`;
+      const result = extractFromSource('main.tf', code);
+      const refs = result.unresolvedReferences.map((r) => r.referenceName);
+      expect(refs.some((r) => r.endsWith(':file'))).toBe(false);
+      // Input wiring is still emitted — the resolver drops it when the
+      // source turns out to be out-of-repo.
+      expect(refs).toContain('module.s3:var.bucket');
     });
 
     it('should emit data.T.N references stripped of the trailing attribute', () => {
